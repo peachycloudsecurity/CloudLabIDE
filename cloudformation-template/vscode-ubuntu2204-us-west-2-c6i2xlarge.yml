@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for AWS Workshop Infrastructure by kubernetes village. Credit to AWS. Large instance (c6i.2xlarge) variant.
+
+Parameters:
+  Region:
+    Type: String
+    Default: us-west-2
+    Description: AWS region to deploy resources
+  AmiParameterStoreName:
+    Type: String
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: Ubuntu 22.04 LTS AMI Parameter Store Name
+  CodeServerVersion:
+    Type: String
+    Default: 4.91.1
+    Description: Version of Code Server to use
+  StackName:
+    Type: String
+    Default: peachycloudsec-ubuntu2204-uswest2-large
+    Description: The name of the CloudFormation stack
+
+Resources:
+  # Secrets Manager for VSCode Password
+  VSCodePasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${StackName}-password-secret"
+      Description: "Randomly generated password for VSCode"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "vscode-user"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        RequireEachIncludedType: false
+        ExcludeCharacters: '!"#$%&''()*+,-./:;<=>?@[\]^_`{|}~'
+
+  # VPC
+  EksVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: peachycloudsec-eks_vpc
+
+  # Internet Gateway
+  EksIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: peachycloudsec-eks_igw
+
+  EksVpcIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref EksVpc
+      InternetGatewayId: !Ref EksIgw
+
+  # Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EksVpc
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: !Ref Region
+      Tags:
+        - Key: Name
+          Value: peachycloudsec-public_subnet
+
+  # Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EksVpc
+      Tags:
+        - Key: Name
+          Value: peachycloudsec-public_route_table
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref EksIgw
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group
+  IdeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: IDE Security Group
+      VpcId: !Ref EksVpc
+      SecurityGroupIngress:
+        - Description: Allow HTTP from CloudFront
+          FromPort: 8080
+          ToPort: 8080
+          IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+        - Description: Allow traffic on port 1337
+          FromPort: 1337
+          ToPort: 1337
+          IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - Description: Allow all outbound traffic
+          FromPort: 0
+          ToPort: 0
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: peachycloudsec-ide_sg
+
+  # IAM Role for EC2 Instance
+  IdeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackName}-ide-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: !Sub "${StackName}-secrets-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref VSCodePasswordSecret
+
+  # EC2 Instance Profile
+  IdeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${StackName}-instance-profile"
+      Roles:
+        - !Ref IdeInstanceRole
+
+  # EC2 Instance for Code Server
+  EksInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: c6i.2xlarge
+      ImageId: !Sub "resolve:ssm:${AmiParameterStoreName}"
+      SubnetId: !Ref PublicSubnet
+      IamInstanceProfile: !Ref IdeInstanceProfile
+      SecurityGroupIds:
+        - !Ref IdeSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y git tar gzip vim nodejs npm build-essential awscli jq curl unzip
+          curl -Ls -o /tmp/code-server.deb https://github.com/coder/code-server/releases/download/v${CodeServerVersion}/code-server_${CodeServerVersion}_amd64.deb
+          dpkg -i /tmp/code-server.deb
+          npm cache clean --force
+          systemctl enable code-server@ubuntu
+          PASSWORD_SECRET=$(aws secretsmanager get-secret-value --secret-id ${VSCodePasswordSecret} --region ${Region} --query 'SecretString' --output text)
+          IDE_PASSWORD=$(echo "$PASSWORD_SECRET" | jq -r '.password')
+          sudo -u ubuntu mkdir -p /home/ubuntu/.config/code-server/
+          # NOTE: Password is stored in plain text in config.yaml - acceptable for labs, NOT for production
+          echo -e "bind-addr: 0.0.0.0:8080\nauth: password\npassword: $IDE_PASSWORD\ncert: false" | sudo -u ubuntu tee /home/ubuntu/.config/code-server/config.yaml > /dev/null
+          systemctl start code-server@ubuntu
+          curl -fsSL https://raw.githubusercontent.com/kubernetesvillage/CloudLabIDE/refs/heads/main/pre-deploy-folder/pre-deploy.sh | bash
+      Tags:
+        - Key: Name
+          Value: peachycloudsec-eks-workshop-ide-large
+
+  # CloudFront Distribution
+  VSCodeDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt EksInstance.PublicDnsName
+            Id: eks-vscode-origin
+            CustomOriginConfig:
+              HTTPPort: 8080
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: eks-vscode-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: true
+            Cookies:
+              Forward: all
+            Headers:
+              - '*'
+        Enabled: true
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+Outputs:
+  CloudFrontUrl:
+    Description: "The CloudFront URL for VSCode access"
+    Value: !Sub "https://${VSCodeDistribution.DomainName}"
+
+  SecretsManagerUrl:
+    Description: "URL to access the VSCode password secret"
+    Value: !Sub "https://console.aws.amazon.com/secretsmanager/home?region=${Region}#/secret?name=${VSCodePasswordSecret}"
