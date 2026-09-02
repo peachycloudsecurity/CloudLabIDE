@@ -112,11 +112,6 @@ Resources:
           ToPort: 1337
           IpProtocol: tcp
           CidrIp: 0.0.0.0/0
-        - Description: Allow web UI access on port 5000
-          FromPort: 5000
-          ToPort: 5000
-          IpProtocol: tcp
-          CidrIp: 0.0.0.0/0
       SecurityGroupEgress:
         - Description: Allow all outbound traffic
           FromPort: 0
