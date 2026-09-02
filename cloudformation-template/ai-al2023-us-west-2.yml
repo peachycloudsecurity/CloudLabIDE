@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: CloudFormation template for AWS Workshop Infrastructure by kubernetes village. Credit to AWS. Large instance (c6i.2xlarge) variant.
+Description: CloudFormation template for AWS Workshop Infrastructure by kubernetes village. Credit to AWS. AI/ML workloads variant with c6i.2xlarge instance.
 
 Parameters:
   Region:
@@ -8,15 +8,15 @@ Parameters:
     Description: AWS region to deploy resources
   AmiParameterStoreName:
     Type: String
-    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
-    Description: Ubuntu 22.04 LTS AMI Parameter Store Name
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: AMI Parameter Store Name
   CodeServerVersion:
     Type: String
     Default: 4.91.1
     Description: Version of Code Server to use
   StackName:
     Type: String
-    Default: peachycloudsec-ubuntu2204-uswest2-large
+    Default: peachycloudsec-al2023-uswest2-ai
     Description: The name of the CloudFormation stack
 
 Resources:
@@ -173,7 +173,7 @@ Resources:
         HttpEndpoint: enabled
         HttpPutResponseHopLimit: 1
       BlockDeviceMappings:
-        - DeviceName: /dev/sda1
+        - DeviceName: /dev/xvda
           Ebs:
             VolumeSize: 50
             VolumeType: gp3
@@ -183,23 +183,21 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -x
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -y
-          apt-get install -y git tar gzip vim nodejs npm build-essential awscli jq curl unzip
-          curl -Ls -o /tmp/code-server.deb https://github.com/coder/code-server/releases/download/v${CodeServerVersion}/code-server_${CodeServerVersion}_amd64.deb
-          dpkg -i /tmp/code-server.deb
+          yum install -y git tar gzip vim nodejs npm make gcc g++ awscli jq
+          curl -Ls -o /tmp/coderinstall.rpm https://github.com/coder/code-server/releases/download/v4.91.1/code-server-4.91.1-amd64.rpm
+          sudo rpm -U "/tmp/coderinstall.rpm"
           npm cache clean --force
-          systemctl enable code-server@ubuntu
+          systemctl enable code-server@ec2-user
           PASSWORD_SECRET=$(aws secretsmanager get-secret-value --secret-id ${VSCodePasswordSecret} --region ${Region} --query 'SecretString' --output text)
           IDE_PASSWORD=$(echo "$PASSWORD_SECRET" | jq -r '.password')
-          sudo -u ubuntu mkdir -p /home/ubuntu/.config/code-server/
+          sudo -u ec2-user mkdir -p /home/ec2-user/.config/code-server/
           # NOTE: Password is stored in plain text in config.yaml - acceptable for labs, NOT for production
-          echo -e "bind-addr: 0.0.0.0:8080\nauth: password\npassword: $IDE_PASSWORD\ncert: false" | sudo -u ubuntu tee /home/ubuntu/.config/code-server/config.yaml > /dev/null
-          systemctl start code-server@ubuntu
+          echo -e "bind-addr: 0.0.0.0:8080\nauth: password\npassword: $IDE_PASSWORD\ncert: false" | sudo -u ec2-user tee /home/ec2-user/.config/code-server/config.yaml > /dev/null
+          systemctl start code-server@ec2-user
           curl -fsSL https://raw.githubusercontent.com/kubernetesvillage/CloudLabIDE/refs/heads/main/pre-deploy-folder/pre-deploy.sh | bash
       Tags:
         - Key: Name
-          Value: peachycloudsec-eks-workshop-ide-large
+          Value: peachycloudsec-eks-workshop-ide-ai
 
   # CloudFront Distribution
   VSCodeDistribution:
